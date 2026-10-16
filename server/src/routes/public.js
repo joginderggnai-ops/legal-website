@@ -1,6 +1,6 @@
 'use strict';
 const express = require('express');
-const { db } = require('../db');
+const db = require('../db');
 const mail = require('../mail');
 const blog = require('../views/blog');
 const { PRACTICE_AREAS, rateLimit, formatDate, parseUtc } = require('../util');
@@ -8,19 +8,21 @@ const { PRACTICE_AREAS, rateLimit, formatDate, parseUtc } = require('../util');
 const router = express.Router();
 
 // A post is public once published and its publish time has passed (so posts can be scheduled).
-const PUBLIC = "status = 'published' AND published_at IS NOT NULL AND published_at <= datetime('now')";
+const PUBLIC = "status = 'published' AND published_at IS NOT NULL AND published_at <= ?";
 const CARD_COLS = 'id, title, slug, excerpt, category, cover_image, cover_alt, published_at';
 
 /* ---------------------------------------------------------------- Contact form → leads */
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/;
 const field = (v, max) => (typeof v === 'string' ? v.replace(/\u0000/g, '').trim().slice(0, max) : '');
+// Waits for the alert email, but never more than 8 seconds (serverless functions stop after the response).
+const withTimeout = (promise, ms) => Promise.race([promise, new Promise((resolve) => setTimeout(resolve, ms))]);
 
 router.post(
   '/api/contact',
   rateLimit({ windowMs: 60 * 60 * 1000, max: 10, message: 'Too many enquiries from your connection. Please email or call us instead.' }),
   express.json({ limit: '20kb' }),
-  (req, res) => {
+  async (req, res) => {
     const b = req.body || {};
     if (b.website) return res.status(201).json({ ok: true }); // honeypot: pretend success to bots
 
@@ -40,25 +42,28 @@ router.post(
     if (!PRACTICE_AREAS.includes(lead.practice_area)) errors.practiceArea = 'Please choose a practice area.';
     if (Object.keys(errors).length) return res.status(422).json({ ok: false, errors });
 
-    const row = db.prepare(`
+    const row = await db.get(`
       INSERT INTO leads (name, email, phone, company, practice_area, message, page, ip, user_agent)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-      RETURNING id, created_at`).get(
+      RETURNING id, created_at`, [
       lead.name, lead.email, lead.phone, lead.company, lead.practice_area, lead.message, lead.page,
       req.ip || '', field(req.get('user-agent'), 300)
+    ]);
+
+    await withTimeout(
+      mail.sendLeadAlert({ ...lead, ...row }).catch((err) => console.error('[mail] lead alert failed:', err.message)),
+      8000
     );
     res.status(201).json({ ok: true });
-
-    mail.sendLeadAlert({ ...lead, ...row }).catch((err) => console.error('[mail] lead alert failed:', err.message));
   }
 );
 
-/* ---------------------------------------------------------------- Blog JSON for the home page */
+/* ---------------------------------------------------------------- Blog JSON for the home page and footer */
 
-router.get('/api/posts', (req, res) => {
+router.get('/api/posts', async (req, res) => {
   const limit = Math.min(Math.max(parseInt(req.query.limit, 10) || 3, 1), 12);
-  const posts = db.prepare(`SELECT ${CARD_COLS} FROM posts WHERE ${PUBLIC} ORDER BY published_at DESC LIMIT ?`).all(limit);
-  res.set('Cache-Control', 'public, max-age=300');
+  const posts = await db.all(`SELECT ${CARD_COLS} FROM posts WHERE ${PUBLIC} ORDER BY published_at DESC LIMIT ?`, [db.nowSql(), limit]);
+  res.set('Cache-Control', 'public, max-age=60, s-maxage=60, stale-while-revalidate=300');
   res.json({
     posts: posts.map((p) => ({
       title: p.title,
@@ -77,28 +82,30 @@ router.get('/api/posts', (req, res) => {
 
 const PER_PAGE = 9;
 
-router.get('/blog', (req, res) => {
-  const total = db.prepare(`SELECT COUNT(*) AS n FROM posts WHERE ${PUBLIC}`).get().n;
+router.get('/blog', async (req, res) => {
+  const now = db.nowSql();
+  const total = (await db.get(`SELECT COUNT(*) AS n FROM posts WHERE ${PUBLIC}`, [now])).n;
   const pages = Math.max(1, Math.ceil(total / PER_PAGE));
   const pageNo = Math.min(Math.max(parseInt(req.query.page, 10) || 1, 1), pages);
-  const posts = db.prepare(`SELECT ${CARD_COLS} FROM posts WHERE ${PUBLIC} ORDER BY published_at DESC LIMIT ? OFFSET ?`)
-    .all(PER_PAGE, (pageNo - 1) * PER_PAGE);
-  res.set('Cache-Control', 'public, max-age=300');
+  const posts = await db.all(`SELECT ${CARD_COLS} FROM posts WHERE ${PUBLIC} ORDER BY published_at DESC LIMIT ? OFFSET ?`,
+    [now, PER_PAGE, (pageNo - 1) * PER_PAGE]);
+  res.set('Cache-Control', 'public, max-age=60, s-maxage=60, stale-while-revalidate=300');
   res.send(blog.indexPage({ posts, pageNo, pages }));
 });
 
-router.get('/blog/sitemap.xml', (req, res) => {
-  const posts = db.prepare(`SELECT slug, updated_at FROM posts WHERE ${PUBLIC} ORDER BY published_at DESC`).all();
+router.get('/blog/sitemap.xml', async (req, res) => {
+  const posts = await db.all(`SELECT slug, updated_at FROM posts WHERE ${PUBLIC} ORDER BY published_at DESC`, [db.nowSql()]);
   res.type('application/xml').set('Cache-Control', 'public, max-age=3600').send(blog.sitemap(posts));
 });
 
-router.get('/blog/:slug', (req, res) => {
-  const post = db.prepare(`SELECT * FROM posts WHERE slug = ? AND ${PUBLIC}`).get(req.params.slug);
+router.get('/blog/:slug', async (req, res) => {
+  const now = db.nowSql();
+  const post = await db.get(`SELECT * FROM posts WHERE slug = ? AND ${PUBLIC}`, [req.params.slug, now]);
   if (!post) return res.status(404).send(blog.notFoundPage());
-  const related = db.prepare(`
+  const related = await db.all(`
     SELECT ${CARD_COLS} FROM posts WHERE ${PUBLIC} AND id <> ?
-    ORDER BY (category = ? AND category <> '') DESC, published_at DESC LIMIT 3`).all(post.id, post.category);
-  res.set('Cache-Control', 'public, max-age=300');
+    ORDER BY (category = ? AND category <> '') DESC, published_at DESC LIMIT 3`, [now, post.id, post.category]);
+  res.set('Cache-Control', 'public, max-age=60, s-maxage=60, stale-while-revalidate=300');
   res.send(blog.postPage(post, related));
 });
 

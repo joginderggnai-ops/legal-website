@@ -1,0 +1,25 @@
+{
+  "name": "resurgent-legal-website",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Resurgent Legal LLP website: static pages plus a backend for leads, the blog and the admin panel",
+  "engines": {
+    "node": ">=22.13"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env server/src/server.js",
+    "dev": "node --env-file-if-exists=.env --watch server/src/server.js",
+    "build": "node server/scripts/build-static.js",
+    "create-user": "node --env-file-if-exists=.env server/scripts/create-user.js",
+    "backup": "node --env-file-if-exists=.env server/scripts/backup.js"
+  },
+  "dependencies": {
+    "@vercel/blob": "2.8.0",
+    "express": "5.3.0",
+    "multer": "2.4.0",
+    "nodemailer": "10.1.1",
+    "pg": "8.23.1",
+    "quill": "2.0.2",
+    "sanitize-html": "2.18.0"
+  }
+}

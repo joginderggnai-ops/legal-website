@@ -1,4 +1,7 @@
 node_modules/
+# Vercel build output (npm run build) and local CLI state
+public/
+.vercel/
+# Local database, uploads and secrets
 server/data/
-server/.env
 .env

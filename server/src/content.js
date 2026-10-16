@@ -39,7 +39,7 @@ function sanitizeBody(html) {
       },
       img: (tagName, attribs) => ({ tagName, attribs: { ...attribs, loading: 'lazy' } })
     },
-    // Images must be uploaded here (/uploads/…) or come from an https address.
+    // Images must be uploaded here (/uploads/… or Vercel Blob) or come from an https address.
     exclusiveFilter: (frame) => frame.tag === 'img' && !/^(\/uploads\/|https:\/\/)/.test(frame.attribs.src || '')
   });
 }
@@ -60,24 +60,45 @@ function sniffImage(buf) {
   return null;
 }
 
+const MIME = { jpg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif' };
+const BLOB_HOST = /^https:\/\/[a-z0-9]+\.public\.blob\.vercel-storage\.com\//;
+
 // Saves an uploaded image and returns its public URL, or throws a user-facing Error.
-function saveImage(file) {
+// Uses Vercel Blob when BLOB_READ_WRITE_TOKEN is set, otherwise the local uploads folder.
+async function saveImage(file) {
   if (!file || !file.buffer || !file.buffer.length) throw new Error('No image was uploaded.');
   const ext = sniffImage(file.buffer);
   if (!ext) throw new Error('Please upload a JPG, PNG, WebP or GIF image.');
   const now = new Date();
   const dir = `${now.getUTCFullYear()}/${String(now.getUTCMonth() + 1).padStart(2, '0')}`;
-  fs.mkdirSync(path.join(config.uploadsDir, dir), { recursive: true });
   const name = `${crypto.randomBytes(8).toString('hex')}.${ext}`;
-  fs.writeFileSync(path.join(config.uploadsDir, dir, name), file.buffer);
+
+  if (config.blobToken) {
+    const { put } = require('@vercel/blob');
+    const blob = await put(`blog/${dir}/${name}`, file.buffer, {
+      access: 'public', contentType: MIME[ext], token: config.blobToken, addRandomSuffix: false
+    });
+    return blob.url;
+  }
+  if (config.onVercel) throw new Error('Image storage is not set up yet. Connect a Vercel Blob store to this project.');
+  await fs.promises.mkdir(path.join(config.uploadsDir, dir), { recursive: true });
+  await fs.promises.writeFile(path.join(config.uploadsDir, dir, name), file.buffer);
   return `/uploads/${dir}/${name}`;
 }
 
-// Deletes an uploaded file previously returned by saveImage (ignores anything outside /uploads/).
-function deleteImage(url) {
-  const m = /^\/uploads\/(\d{4}\/\d{2}\/[a-f0-9]{16}\.(?:jpg|png|webp|gif))$/.exec(url || '');
-  if (!m) return;
-  fs.rm(path.join(config.uploadsDir, m[1]), { force: true }, () => {});
+// Deletes an image previously returned by saveImage (ignores anything else, e.g. external URLs).
+async function deleteImage(url) {
+  try {
+    if (config.blobToken && BLOB_HOST.test(url || '')) {
+      const { del } = require('@vercel/blob');
+      await del(url, { token: config.blobToken });
+      return;
+    }
+    const m = /^\/uploads\/(\d{4}\/\d{2}\/[a-f0-9]{16}\.(?:jpg|png|webp|gif))$/.exec(url || '');
+    if (m) await fs.promises.rm(path.join(config.uploadsDir, m[1]), { force: true });
+  } catch (err) {
+    console.error('[content] could not delete image:', err.message);
+  }
 }
 
 module.exports = { sanitizeBody, upload, saveImage, deleteImage, MAX_BYTES };

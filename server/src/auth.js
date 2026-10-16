@@ -1,7 +1,7 @@
 'use strict';
-// Passwords (scrypt), cookie sessions stored in SQLite, CSRF tokens and role checks.
+// Passwords (scrypt), cookie sessions stored in the database, CSRF tokens and role checks.
 const crypto = require('node:crypto');
-const { db } = require('./db');
+const db = require('./db');
 const config = require('./config');
 
 const COOKIE = 'rl_admin';
@@ -40,13 +40,31 @@ function passwordProblem(password) {
   return '';
 }
 
+// Creates the first administrator from INITIAL_ADMIN_EMAIL / INITIAL_ADMIN_PASSWORD when no users exist.
+let initialAdminChecked = false;
+async function ensureInitialAdmin() {
+  if (initialAdminChecked) return;
+  const { email, password, name } = config.initialAdmin;
+  if (email && password) {
+    if (passwordProblem(password)) {
+      console.warn('[auth] INITIAL_ADMIN_PASSWORD is too short (at least 10 characters); no administrator created.');
+    } else if ((await db.get('SELECT COUNT(*) AS n FROM users')).n === 0) {
+      await db.run("INSERT INTO users (email, name, role, password_hash) VALUES (?, ?, 'admin', ?)", [email, name, hashPassword(password)]);
+      console.log(`[auth] Created the first administrator: ${email}`);
+    }
+  }
+  initialAdminChecked = true;
+}
+
 const sha256 = (s) => crypto.createHash('sha256').update(s).digest('hex');
 
 function parseCookies(header) {
   const out = {};
   for (const part of String(header || '').split(';')) {
     const i = part.indexOf('=');
-    if (i > 0) out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim());
+    if (i > 0) {
+      try { out[part.slice(0, i).trim()] = decodeURIComponent(part.slice(i + 1).trim()); } catch { /* ignore malformed */ }
+    }
   }
   return out;
 }
@@ -63,43 +81,44 @@ function setCookie(res, value, maxAgeMs) {
   res.append('Set-Cookie', parts.join('; '));
 }
 
-function createSession(res, userId) {
+async function createSession(res, userId) {
   const token = crypto.randomBytes(32).toString('base64url');
   const csrf = crypto.randomBytes(24).toString('base64url');
-  db.prepare('INSERT INTO sessions (token_hash, user_id, csrf, expires_at) VALUES (?, ?, ?, ?)')
-    .run(sha256(token), userId, csrf, Date.now() + SESSION_MS);
-  db.prepare("UPDATE users SET last_login_at = datetime('now') WHERE id = ?").run(userId);
+  await db.run('INSERT INTO sessions (token_hash, user_id, csrf, expires_at) VALUES (?, ?, ?, ?)',
+    [sha256(token), userId, csrf, Date.now() + SESSION_MS]);
+  await db.run('UPDATE users SET last_login_at = ? WHERE id = ?', [db.nowSql(), userId]);
+  await db.run('DELETE FROM sessions WHERE expires_at < ?', [Date.now()]); // tidy up expired sessions
   setCookie(res, token, SESSION_MS);
 }
 
-function destroySession(req, res) {
+async function destroySession(req, res) {
   const token = parseCookies(req.headers.cookie)[COOKIE];
-  if (token) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(sha256(token));
+  if (token) await db.run('DELETE FROM sessions WHERE token_hash = ?', [sha256(token)]);
   setCookie(res, '', 0);
 }
 
 // Ends every session for a user (after a password reset or deactivation), optionally keeping one.
-function endUserSessions(userId, keepTokenHash) {
-  if (keepTokenHash) db.prepare('DELETE FROM sessions WHERE user_id = ? AND token_hash <> ?').run(userId, keepTokenHash);
-  else db.prepare('DELETE FROM sessions WHERE user_id = ?').run(userId);
+async function endUserSessions(userId, keepTokenHash) {
+  if (keepTokenHash) await db.run('DELETE FROM sessions WHERE user_id = ? AND token_hash <> ?', [userId, keepTokenHash]);
+  else await db.run('DELETE FROM sessions WHERE user_id = ?', [userId]);
 }
 
 // Loads req.user / req.csrf from the session cookie. Sessions slide: renewed when half used.
-function loadSession(req, res, next) {
+async function loadSession(req, res, next) {
   const token = parseCookies(req.headers.cookie)[COOKIE];
   if (!token) return next();
   const tokenHash = sha256(token);
-  const row = db.prepare(`
+  const row = await db.get(`
     SELECT s.csrf, s.expires_at, u.id, u.email, u.name, u.role, u.active
     FROM sessions s JOIN users u ON u.id = s.user_id
-    WHERE s.token_hash = ?`).get(tokenHash);
+    WHERE s.token_hash = ?`, [tokenHash]);
   if (!row || row.expires_at < Date.now() || !row.active) {
-    if (row) db.prepare('DELETE FROM sessions WHERE token_hash = ?').run(tokenHash);
+    if (row) await db.run('DELETE FROM sessions WHERE token_hash = ?', [tokenHash]);
     setCookie(res, '', 0);
     return next();
   }
   if (row.expires_at - Date.now() < SESSION_MS / 2) {
-    db.prepare('UPDATE sessions SET expires_at = ? WHERE token_hash = ?').run(Date.now() + SESSION_MS, tokenHash);
+    await db.run('UPDATE sessions SET expires_at = ? WHERE token_hash = ?', [Date.now() + SESSION_MS, tokenHash]);
     setCookie(res, token, SESSION_MS);
   }
   req.user = { id: row.id, email: row.email, name: row.name, role: row.role };
@@ -140,6 +159,7 @@ function sameOrigin(req, res, next) {
 }
 
 // Login throttling: 8 failed attempts per IP or per email in 15 minutes.
+// Kept in memory, so on Vercel it applies per running instance.
 const failures = new Map();
 const WINDOW = 15 * 60 * 1000;
 function loginBlocked(ip, email) {
@@ -164,11 +184,10 @@ function clearFailures(ip, email) {
 setInterval(() => {
   const now = Date.now();
   for (const [k, f] of failures) if (f.reset <= now) failures.delete(k);
-  db.prepare('DELETE FROM sessions WHERE expires_at < ?').run(now);
 }, 10 * 60 * 1000).unref();
 
 module.exports = {
-  MIN_PASSWORD, hashPassword, verifyPassword, generatePassword, passwordProblem,
+  MIN_PASSWORD, hashPassword, verifyPassword, generatePassword, passwordProblem, ensureInitialAdmin,
   createSession, destroySession, endUserSessions, loadSession,
   requireUser, requireAdmin, checkCsrf, sameOrigin,
   loginBlocked, recordFailure, clearFailures

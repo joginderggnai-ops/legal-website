@@ -324,20 +324,7 @@
     };
 
     if (!CONFIG.formEndpoint || window.location.protocol === 'file:') {
-      var body = [
-        'Name: ' + payload.name,
-        'Email: ' + payload.email,
-        'Phone: ' + payload.phone,
-        'Company: ' + (payload.company || '-'),
-        'Practice area: ' + payload.practiceArea,
-        '',
-        payload.message
-      ].join('\n');
-      window.location.href = 'mailto:' + CONFIG.contactEmail +
-        '?subject=' + encodeURIComponent('Consultation request: ' + payload.practiceArea) +
-        '&body=' + encodeURIComponent(body);
-      setStatus('info', 'Your email app should open with your enquiry filled in — just press send. If nothing opens, email ' +
-        CONFIG.contactEmail + ' or call ' + CONFIG.contactPhone + '.');
+      openMailto(payload);
       return;
     }
 
@@ -358,16 +345,40 @@
         body: JSON.stringify(payload)
       });
     }).then(function (res) {
-      if (!res.ok) throw new Error('HTTP ' + res.status);
-      form.reset();
-      counter.textContent = '0';
-      setStatus('success', 'Thank you for reaching out. Our team will respond within 24 business hours.');
+      if (res.ok) {
+        form.reset();
+        counter.textContent = '0';
+        setStatus('success', 'Thank you for reaching out. Our team will respond within 24 business hours.');
+      } else if (res.status === 422 || res.status === 429) {
+        setStatus('error', (res.status === 429 ? 'You have already sent several enquiries.' : 'Please check your details and try again.') +
+          ' You can also email ' + CONFIG.contactEmail + ' or call ' + CONFIG.contactPhone + '.');
+      } else {
+        throw new Error('HTTP ' + res.status);
+      }
     }).catch(function () {
-      setStatus('error', 'Sorry, your message could not be sent. Please try again, email ' +
-        CONFIG.contactEmail + ' or call ' + CONFIG.contactPhone + '.');
+      // The server is unreachable: hand the enquiry to the visitor's email app so it isn't lost.
+      openMailto(payload);
     }).then(function () {
       submitBtn.disabled = false;
       submitLabel.textContent = 'Request a Consultation';
     });
   });
+
+  // Opens the visitor's email app with the enquiry filled in (no backend, or the backend is unreachable).
+  function openMailto(payload) {
+    var body = [
+      'Name: ' + payload.name,
+      'Email: ' + payload.email,
+      'Phone: ' + payload.phone,
+      'Company: ' + (payload.company || '-'),
+      'Practice area: ' + payload.practiceArea,
+      '',
+      payload.message
+    ].join('\n');
+    window.location.href = 'mailto:' + CONFIG.contactEmail +
+      '?subject=' + encodeURIComponent('Consultation request: ' + payload.practiceArea) +
+      '&body=' + encodeURIComponent(body);
+    setStatus('info', 'Your email app should open with your enquiry filled in — just press send. If nothing opens, email ' +
+      CONFIG.contactEmail + ' or call ' + CONFIG.contactPhone + '.');
+  }
 })();
