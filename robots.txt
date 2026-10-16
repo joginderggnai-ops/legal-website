@@ -1,0 +1,8 @@
+User-agent: *
+Allow: /
+Disallow: /admin
+Disallow: /api
+Disallow: /thank-you
+
+Sitemap: https://www.resurgentlegal.com/sitemap.xml
+Sitemap: https://www.resurgentlegal.com/blog/sitemap.xml
